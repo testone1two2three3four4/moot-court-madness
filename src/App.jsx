@@ -1,9 +1,12 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 
 const ROUND_NAMES_LEFT = ["First Round", "Round of 32", "Sweet 16", "Quarterfinals", "Semifinals"];
 const ROUND_NAMES_RIGHT = ["Semifinals", "Quarterfinals", "Sweet 16", "Round of 32", "First Round"];
 
-function initParticipants() {
+const STORAGE_KEY_PARTICIPANTS = "mcm_participants";
+const STORAGE_KEY_ADVANCES = "mcm_advances";
+
+function createFreshParticipants() {
   return Array.from({ length: 64 }, (_, i) => ({
     id: i + 1,
     seed: i + 1,
@@ -13,8 +16,80 @@ function initParticipants() {
   }));
 }
 
-function initAdvances() {
+function createFreshAdvances() {
   return { left: [[], [], [], [], []], right: [[], [], [], [], []], champion: null };
+}
+
+/*
+ * Load from localStorage, falling back to fresh data if nothing saved.
+ * Wrapped in try/catch because localStorage can throw if storage is
+ * full or blocked (e.g. some private browsing modes).
+ */
+function loadParticipants() {
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY_PARTICIPANTS);
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      if (Array.isArray(parsed) && parsed.length === 64) return parsed;
+    }
+  } catch (e) {
+    console.warn("Could not load saved participants:", e);
+  }
+  return createFreshParticipants();
+}
+
+function loadAdvances() {
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY_ADVANCES);
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      if (parsed && parsed.left && parsed.right) return parsed;
+    }
+  } catch (e) {
+    console.warn("Could not load saved advances:", e);
+  }
+  return createFreshAdvances();
+}
+
+function saveParticipants(data) {
+  try {
+    localStorage.setItem(STORAGE_KEY_PARTICIPANTS, JSON.stringify(data));
+  } catch (e) {
+    console.warn("Could not save participants:", e);
+  }
+}
+
+function saveAdvances(data) {
+  try {
+    localStorage.setItem(STORAGE_KEY_ADVANCES, JSON.stringify(data));
+  } catch (e) {
+    console.warn("Could not save advances:", e);
+  }
+}
+
+/*
+ * Compress an image to a smaller base64 string before storing it.
+ * Photos at full resolution can blow past localStorage's ~5 MB limit
+ * quickly with 64 participants, so we resize to 150px and use JPEG.
+ */
+function compressImage(dataUrl, maxSize = 150) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement("canvas");
+      let w = img.width;
+      let h = img.height;
+      if (w > h) { h = (maxSize * h) / w; w = maxSize; }
+      else       { w = (maxSize * w) / h; h = maxSize; }
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(img, 0, 0, w, h);
+      resolve(canvas.toDataURL("image/jpeg", 0.7));
+    };
+    img.onerror = () => resolve(dataUrl); // fallback to original
+    img.src = dataUrl;
+  });
 }
 
 /* ── Avatar component ── */
@@ -222,14 +297,31 @@ function TrophySVG() {
    MAIN APP COMPONENT
    ════════════════════════════════════════════ */
 export default function App() {
-  const [participants, setParticipants] = useState(initParticipants);
-  const [advances, setAdvances] = useState(initAdvances);
+  const [participants, setParticipants] = useState(loadParticipants);
+  const [advances, setAdvances] = useState(loadAdvances);
   const [editing, setEditing] = useState(null);
   const [form, setForm] = useState({ name: "", school: "", photo: null });
   const [tab, setTab] = useState("bracket");
+  const [saveStatus, setSaveStatus] = useState(null); // "saved" | "error" | null
   const fileRef = useRef(null);
 
   const BRACKET_H = 1180;
+
+  /* Auto-save participants whenever they change */
+  useEffect(() => {
+    saveParticipants(participants);
+    setSaveStatus("saved");
+    const timer = setTimeout(() => setSaveStatus(null), 1500);
+    return () => clearTimeout(timer);
+  }, [participants]);
+
+  /* Auto-save advances whenever they change */
+  useEffect(() => {
+    saveAdvances(advances);
+    setSaveStatus("saved");
+    const timer = setTimeout(() => setSaveStatus(null), 1500);
+    return () => clearTimeout(timer);
+  }, [advances]);
 
   /* participant lookup */
   const pById = useCallback((id) => participants.find((p) => p.id === id), [participants]);
@@ -290,8 +382,23 @@ export default function App() {
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = (ev) => setForm((f) => ({ ...f, photo: ev.target.result }));
+    reader.onload = async (ev) => {
+      // Compress before storing so 64 photos don't exceed localStorage limits
+      const compressed = await compressImage(ev.target.result, 150);
+      setForm((f) => ({ ...f, photo: compressed }));
+    };
     reader.readAsDataURL(file);
+  };
+
+  /* Reset all data */
+  const resetAll = () => {
+    if (window.confirm("This will clear ALL participant data and bracket progress. Are you sure?")) {
+      const fresh = createFreshParticipants();
+      setParticipants(fresh);
+      setAdvances(createFreshAdvances());
+      saveParticipants(fresh);
+      saveAdvances(createFreshAdvances());
+    }
   };
 
   /* render one side of the bracket */
@@ -427,13 +534,49 @@ export default function App() {
       {/* ═══ BRACKET TAB ═══ */}
       {tab === "bracket" && (
         <section style={{ padding: "16px 8px 40px", position: "relative" }}>
+          {/* Save indicator */}
+          <div style={{
+            position: "fixed", bottom: 20, right: 20, zIndex: 999,
+            display: "flex", gap: 8, alignItems: "center",
+          }}>
+            {saveStatus === "saved" && (
+              <div style={{
+                background: "rgba(34,120,69,0.9)", color: "#fff",
+                padding: "6px 14px", borderRadius: 20,
+                fontSize: "0.7rem", fontWeight: 600,
+                animation: "fadeIn 0.3s ease",
+                backdropFilter: "blur(8px)",
+                boxShadow: "0 2px 12px rgba(0,0,0,0.2)",
+              }}>
+                ✓ Saved
+              </div>
+            )}
+            <button
+              onClick={resetAll}
+              title="Reset all data"
+              style={{
+                width: 36, height: 36, borderRadius: "50%",
+                background: "rgba(107,45,139,0.85)", border: "1px solid rgba(212,168,67,0.3)",
+                color: "#F0D68A", fontSize: "0.85rem", cursor: "pointer",
+                display: "flex", alignItems: "center", justifyContent: "center",
+                backdropFilter: "blur(8px)",
+                boxShadow: "0 2px 12px rgba(0,0,0,0.2)",
+                transition: "transform 0.2s",
+              }}
+              onMouseEnter={e => e.currentTarget.style.transform = "scale(1.1)"}
+              onMouseLeave={e => e.currentTarget.style.transform = "scale(1)"}
+            >
+              ↺
+            </button>
+          </div>
+
           <div style={{ textAlign: "center", marginBottom: 12 }}>
             <span style={{
               fontSize: "0.7rem", color: "#8B3FAF", fontWeight: 500,
               background: "rgba(139,63,175,0.08)", padding: "5px 16px",
               borderRadius: 20, display: "inline-block",
             }}>
-              Click a team to advance them &nbsp;·&nbsp; Click ✎ to edit participant details &amp; upload photos
+              Click a team to advance them &nbsp;·&nbsp; Click ✎ to edit participant details &amp; upload photos &nbsp;·&nbsp; Data saves automatically
             </span>
           </div>
 
